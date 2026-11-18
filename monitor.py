@@ -2,7 +2,7 @@
 """
 币安标的价格监控 + PushPlus 微信推送
 - 单次检测:  python monitor.py --once
-- 循环监控:  python monitor.py --loop-minutes 350
+- 循环监控:  python monitor.py --loop-minutes 70
 - 测试推送:  python monitor.py --test
 """
 import argparse
@@ -84,66 +84,35 @@ def load_state() -> dict:
     return {}
 
 
-STATE_COMMIT_MSG = "chore: update alert state [skip ci]"
-
-
-def _git(*args: str, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        list(args), cwd=BASE_DIR, capture_output=True, text=True, check=check
-    )
-
-
-def _write_state_file(state: dict) -> None:
+def save_state(state: dict) -> None:
     STATE_PATH.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    commit_state()
 
 
-def save_state(state: dict) -> None:
-    _write_state_file(state)
-    commit_state(state)
-
-
-def commit_state(state: dict) -> None:
-    """把 state.json 提交回 main 分支（带冲突重试）。
-
-    相邻场次会重叠运行，push 冲突是常态。这里的要点是：任何一步失败都先
-    `rebase --abort` + `reset --hard` 回到远端基线，再用内存里的 state 重写，
-    避免仓库卡在 rebase 中途——那样重试必然失败并静默丢 state，而丢 state
-    会让 daily 去重失效，变成一天推很多条。
-    """
+def commit_state() -> None:
+    """在 GitHub Actions 环境中把 state.json 提交回仓库（带冲突重试）。"""
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
-    for attempt in range(1, 4):
+    for attempt in range(3):
         try:
-            _git("git", "add", "state.json", check=True)
+            subprocess.run(["git", "add", "state.json"], check=True, cwd=BASE_DIR)
             # 没有变更时 commit 返回非零，属正常情况
-            if _git("git", "commit", "-m", STATE_COMMIT_MSG).returncode != 0:
+            r = subprocess.run(
+                ["git", "commit", "-m", "chore: update alert state [skip ci]"],
+                cwd=BASE_DIR, capture_output=True, text=True,
+            )
+            if r.returncode != 0:
                 return
-            _git("git", "fetch", "origin", "main", check=True)
-            rb = _git("git", "rebase", "origin/main")
-            if rb.returncode == 0:
-                ps = _git("git", "push", "origin", "HEAD:main")
-                if ps.returncode == 0:
-                    return
-                print(f"state 推送被拒(第 {attempt} 次): "
-                      f"{ps.stderr.strip()[:200]}", flush=True)
-            else:
-                print(f"state rebase 冲突(第 {attempt} 次): "
-                      f"{rb.stderr.strip()[:200]}", flush=True)
-            _git("git", "rebase", "--abort")
-        except subprocess.CalledProcessError as e:
-            print(f"state 提交异常(第 {attempt} 次): {e}", flush=True)
-            _git("git", "rebase", "--abort")
-
-        # 回到远端基线，清掉半途状态，随后用内存里的 state 重写文件
-        if _git("git", "reset", "--hard", "origin/main").returncode != 0:
-            _git("git", "reset", "--hard", "FETCH_HEAD")
-        _write_state_file(state)
-        time.sleep(3 * attempt)
-
-    print("警告: state.json 提交失败，下次运行将按旧状态判断（可能重复提醒）",
-          flush=True)
+            subprocess.run(["git", "pull", "--rebase"], check=True, cwd=BASE_DIR,
+                           capture_output=True)
+            subprocess.run(["git", "push"], check=True, cwd=BASE_DIR,
+                           capture_output=True)
+            return
+        except subprocess.CalledProcessError:
+            time.sleep(5)
+    print("警告: state.json 提交失败，下次运行将按旧状态判断", flush=True)
 
 
 def get_price(symbol: str) -> float | None:
@@ -217,20 +186,8 @@ def condition_text(rule: dict) -> str:
     return f"{op} {rule['threshold']}"
 
 
-def alert_config_error(cfg: dict, symbol: str, state: dict) -> None:
-    """交易对无效时推送一次（每日最多一条，避免长任务里反复刷屏）。"""
-    key = f"__config_error__:{symbol}"
-    today = now_beijing().strftime("%Y-%m-%d")
-    if state.get(key, {}).get("last_alert_date") == today:
-        return
-    if push(cfg["pushplus_token"], "监控配置错误",
-            f"标的 **{symbol}** 在币安不存在或已下架，请检查 config.yaml。"):
-        state[key] = {"alerted": True, "last_alert_date": today}
-        save_state(state)
-
-
-def check_once(cfg: dict, state: dict) -> bool:
-    """对所有规则执行一轮检测。返回 False 表示致命错误，应结束本场运行。"""
+def check_once(cfg: dict, state: dict) -> None:
+    """对所有规则执行一轮检测。"""
     ts = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
     state_changed = False
     for rule in cfg["rules"]:
@@ -238,12 +195,10 @@ def check_once(cfg: dict, state: dict) -> bool:
         try:
             price = get_price(symbol)
         except InvalidSymbolError:
-            if state_changed:
-                save_state(state)
-                state_changed = False
-            alert_config_error(cfg, symbol, state)
-            print(f"[{ts}] {symbol} 交易对无效，结束本场运行", flush=True)
-            return False
+            push(cfg["pushplus_token"], "监控配置错误",
+                 f"标的 **{symbol}** 在币安不存在或已下架，请检查 config.yaml。")
+            print(f"[{ts}] {symbol} 交易对无效，本轮终止", flush=True)
+            sys.exit(0)
         if price is None:
             print(f"[{ts}] {symbol} 价格拉取失败，本轮跳过", flush=True)
             continue
@@ -267,7 +222,6 @@ def check_once(cfg: dict, state: dict) -> bool:
             state_changed = True
     if state_changed:
         save_state(state)
-    return True
 
 
 def test_push(cfg: dict) -> None:
@@ -309,8 +263,7 @@ def main() -> None:
     if args.loop_minutes and args.loop_minutes > 0:
         deadline = time.monotonic() + args.loop_minutes * 60
         while True:
-            if not check_once(cfg, state):
-                break
+            check_once(cfg, state)
             state = load_state()  # 可能被其他并发运行更新
             if time.monotonic() + 60 > deadline:
                 break
